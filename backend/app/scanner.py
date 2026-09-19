@@ -89,14 +89,17 @@ class Scanner:
                 rows = await self.browser.discover()
                 self.browser_connected = bool(self.browser.browser and self.browser.browser.is_connected())
                 self.discovery_rows = len(rows)
-                if self.browser.socket_connected:
+                discovery_live = bool(
+                    self.browser.socket_connected and self.browser.last_socket_frame_at
+                )
+                if discovery_live:
                     self.last_successful_scan = self.browser.last_socket_frame_at
-                recovered = self.last_error is not None
-                self.last_error = None
-                attempt = 0
-                if recovered:
-                    logger.info("DISCOVERY_RECOVERED rows=%s", len(rows))
-                    self.events.publish("health")
+                    recovered = self.last_error is not None
+                    self.last_error = None
+                    attempt = 0
+                    if recovered:
+                        logger.info("DISCOVERY_RECOVERED rows=%s", len(rows))
+                        self.events.publish("health")
                 for row in rows:
                     if self.db.add_discovered(self.settings.chain, row["address"], row["symbol"]):
                         self.last_pair_seen = now_ms()
@@ -297,18 +300,42 @@ class Scanner:
     def health(self):
         now = now_ms()
         counts = self.db.counts()
+        browser_connected = bool(
+            self.browser.browser and self.browser.browser.is_connected()
+        )
         live = bool(self.browser.socket_connected and self.browser.last_socket_frame_at
                     and now - self.browser.last_socket_frame_at <= 60_000)
+        degraded = bool(self.browser.challenge_detected or self.last_error)
+        if live:
+            status = "ok"
+        elif degraded:
+            status = "degraded"
+        else:
+            status = "starting"
+        if live:
+            discovery_source = "websocket"
+        elif self.browser.challenge_detected:
+            discovery_source = "cloudflare_challenge"
+        elif self.browser.socket_connected:
+            discovery_source = "websocket_waiting_for_frame"
+        else:
+            discovery_source = "waiting_for_websocket"
         return {
-            "status": "ok" if live else "starting",
+            "status": status,
             "discovery_status": "LIVE" if live else "STALE",
-            "browser_connected": self.browser_connected,
+            "browser_connected": browser_connected,
             "discovery_connected": self.browser.socket_connected,
+            "cloudflare_challenge": self.browser.challenge_detected,
+            "browser_restart_count": self.browser.restart_count,
+            "page_title": self.browser.last_page_title,
+            "page_url": self.browser.last_page_url,
+            "last_socket_url": self.browser.last_socket_url,
+            "observed_socket_urls": sorted(self.browser.observed_socket_urls),
             "last_socket_frame_at": self.browser.last_socket_frame_at,
             "last_discovery_at": self.last_pair_seen,
             "candidate_count": counts["active_candidates"],
             "qualified_count": counts.get("QUALIFIED", 0),
-            "discovery_source": "websocket" if self.browser.socket_pairs_seen else "dom_fallback_pending",
+            "discovery_source": discovery_source,
             "last_successful_scan": self.last_successful_scan,
             "last_pair_seen": self.last_pair_seen,
             "last_chart_success": self.last_chart_success,

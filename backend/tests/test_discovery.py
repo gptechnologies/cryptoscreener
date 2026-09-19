@@ -1,4 +1,7 @@
+import asyncio
 import json
+
+import pytest
 
 from app.db import Database
 from app.discovery import pairs_from_frame
@@ -40,24 +43,71 @@ def test_delete_qualified_ignores_repeated_discovery_and_clears_chart():
         db.close()
 
 
-def test_browser_socket_frames_feed_one_queue_without_dom_polling():
+@pytest.mark.parametrize("socket_url", [
+    "wss://io.dexscreener.com/dex/screener/v7/pairs/h24/1?rank=age",
+    "wss://io.dexscreener.com/dex/screener/pairs/h24/1?rank=age",
+])
+def test_browser_socket_frames_feed_one_queue_without_dom_polling(socket_url):
     class Socket:
-        url = "wss://io.dexscreener.com/dex/screener/v7/pairs/h24/1"
-
         def __init__(self):
+            self.url = socket_url
             self.handlers = {}
 
         def on(self, event, handler):
             self.handlers[event] = handler
 
-    source = BrowserSource(Settings())
-    socket = Socket()
-    source._on_websocket(socket)
-    socket.handlers["framereceived"](json.dumps({"pairs": [
-        {"chainId": "solana", "pairAddress": PAIR, "baseToken": {"symbol": "TEST"}},
-    ]}))
-    assert source.socket_connected
-    assert source.socket_pairs_seen
-    assert source.discovery_queue.get_nowait() == {"address": PAIR, "symbol": "TEST"}
-    socket.handlers["close"](socket)
-    assert not source.socket_connected
+    async def scenario():
+        source = BrowserSource(Settings())
+        socket = Socket()
+        source._on_websocket(socket)
+        socket.handlers["framereceived"](json.dumps({"pairs": [
+            {"chainId": "solana", "pairAddress": PAIR, "baseToken": {"symbol": "TEST"}},
+        ]}))
+        await asyncio.sleep(0)
+        assert source.socket_connected
+        assert source.socket_pairs_seen
+        assert source.last_socket_frame_at is not None
+        assert source.last_socket_url == socket_url.split("?", 1)[0]
+        assert source.discovery_queue.get_nowait() == {"address": PAIR, "symbol": "TEST"}
+        socket.handlers["close"](socket)
+        assert not source.socket_connected
+
+    asyncio.run(scenario())
+
+
+def test_unrelated_socket_is_observed_but_not_selected():
+    class Socket:
+        url = "wss://example.com/dex/screener/v7/pairs/h24/1?secret=removed"
+
+        def on(self, *_):
+            raise AssertionError("Unrelated sockets must not get frame handlers")
+
+    async def scenario():
+        source = BrowserSource(Settings())
+        source._on_websocket(Socket())
+        assert not source.socket_connected
+        assert source.observed_socket_urls == {"wss://example.com/dex/screener/v7/pairs/h24/1"}
+
+    asyncio.run(scenario())
+
+
+def test_cloudflare_challenge_detection_and_safe_diagnostics():
+    async def scenario():
+        source = BrowserSource(Settings())
+        assert source.is_challenge_page(
+            "Just a moment...",
+            "https://dexscreener.com/new-pairs/solana?__cf_chl_rt_tk=secret",
+        )
+        assert source.is_challenge_page(
+            "DEX Screener",
+            "https://dexscreener.com/new-pairs/solana?__cf_chl_rt_tk=secret",
+        )
+        assert not source.is_challenge_page(
+            "DEX Screener",
+            "https://dexscreener.com/new-pairs/solana?rankBy=pairAge",
+        )
+        assert source._safe_url(
+            "wss://io.dexscreener.com/dex/screener/pairs/h24/1?token=secret"
+        ) == "wss://io.dexscreener.com/dex/screener/pairs/h24/1"
+
+    asyncio.run(scenario())

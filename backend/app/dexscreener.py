@@ -3,7 +3,7 @@ import base64
 import logging
 import re
 from typing import Optional
-from urllib.parse import urlencode
+from urllib.parse import urlencode, urlsplit, urlunsplit
 
 import httpx
 from playwright.async_api import async_playwright
@@ -100,11 +100,20 @@ class BrowserSource:
         self.page = None
         self.socket = None
         self.socket_connected = False
+        self.socket_connected_at = None
         self.last_socket_frame_at = None
         self.discovery_queue = asyncio.Queue(maxsize=1000)
         self.started_at = None
         self.last_dom_fallback_at = 0
         self.socket_pairs_seen = False
+        self.challenge_detected = False
+        self.last_page_title = None
+        self.last_page_url = None
+        self.last_socket_url = None
+        self.observed_socket_urls: set[str] = set()
+        self.restart_count = 0
+        self.resource_blocking_enabled = False
+        self.resource_route_task = None
         self.chart_limiter = RateLimiter(settings.chart_rate)
         self.chart_slots = asyncio.Semaphore(settings.chart_concurrency)
 
@@ -113,22 +122,76 @@ class BrowserSource:
             self.playwright = await async_playwright().start()
             self.browser = await self.playwright.chromium.launch(
                 headless=True,
-                args=["--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu",
-                      "--disable-extensions", "--disable-background-networking",
-                      "--disable-default-apps", "--disable-sync", "--disable-translate",
-                      "--mute-audio"],
+                args=["--no-sandbox", "--disable-dev-shm-usage", "--mute-audio"],
             )
-            self.context = await self.browser.new_context(viewport={"width": 1280, "height": 800}, accept_downloads=False)
+            self.restart_count += 1
+            self.context = await self.browser.new_context(
+                viewport={"width": 1280, "height": 800},
+                accept_downloads=False,
+                locale="en-US",
+                timezone_id="America/New_York",
+            )
             self.page = await self.context.new_page()
-            await self.page.route("**/*", self._route)
             self.page.on("websocket", self._on_websocket)
+            self.page.on("pageerror", lambda error: logger.warning("DISCOVERY_PAGE_ERROR error=%s", error))
             self.browser.on("disconnected", self._on_browser_disconnect)
             self.started_at = now_ms()
-            await self.page.goto(self.settings.discovery_url, wait_until="domcontentloaded", timeout=30000)
-            logger.info("BROWSER_STARTED url=%s", self.page.url)
+            self.challenge_detected = False
+            self.resource_blocking_enabled = False
+            logger.info("BROWSER_STARTED attempt=%s", self.restart_count)
+            await self.page.goto(
+                self.settings.discovery_url,
+                wait_until="domcontentloaded",
+                timeout=int(self.settings.browser_challenge_timeout * 1000),
+            )
+            await self._wait_for_application()
+            logger.info("DISCOVERY_PAGE_READY title=%s url=%s", self.last_page_title, self.last_page_url)
         except Exception:
             await self.close()
             raise
+
+    @staticmethod
+    def _safe_url(value: str) -> str:
+        """Remove query strings so challenge tokens never enter logs or health."""
+        try:
+            parts = urlsplit(value)
+            return urlunsplit((parts.scheme, parts.netloc, parts.path, "", ""))
+        except ValueError:
+            return value.split("?", 1)[0]
+
+    @staticmethod
+    def is_challenge_page(title: str, url: str) -> bool:
+        lowered = (title or "").lower()
+        return (
+            "just a moment" in lowered
+            or "attention required" in lowered
+            or "__cf_chl_" in (url or "")
+            or "/cdn-cgi/challenge" in (url or "")
+        )
+
+    async def _wait_for_application(self):
+        deadline = asyncio.get_running_loop().time() + self.settings.browser_challenge_timeout
+        challenge_logged = False
+        while True:
+            self.last_page_title = await self.page.title()
+            self.last_page_url = self._safe_url(self.page.url)
+            challenged = self.is_challenge_page(self.last_page_title, self.page.url)
+            self.challenge_detected = challenged
+            if not challenged:
+                return
+            if not challenge_logged:
+                logger.warning(
+                    "DISCOVERY_CHALLENGE_DETECTED title=%s url=%s",
+                    self.last_page_title,
+                    self.last_page_url,
+                )
+                challenge_logged = True
+            if asyncio.get_running_loop().time() >= deadline:
+                raise RuntimeError(
+                    f"Dexscreener Cloudflare challenge did not clear within "
+                    f"{self.settings.browser_challenge_timeout:g} seconds"
+                )
+            await asyncio.sleep(2)
 
     async def _route(self, route):
         if route.request.resource_type in {"image", "media", "font"}:
@@ -136,24 +199,47 @@ class BrowserSource:
         else:
             await route.continue_()
 
+    async def _enable_resource_blocking(self):
+        if self.resource_blocking_enabled or not self.page or self.page.is_closed():
+            return
+        await self.page.route("**/*", self._route)
+        self.resource_blocking_enabled = True
+        logger.info("DISCOVERY_RESOURCE_BLOCKING_ENABLED")
+
     def _on_browser_disconnect(self, _):
         self.socket_connected = False
         logger.warning("BROWSER_DISCONNECTED")
 
     def _on_websocket(self, socket):
-        if "/dex/screener/v7/pairs/" not in socket.url:
+        safe_url = self._safe_url(socket.url)
+        if safe_url not in self.observed_socket_urls:
+            self.observed_socket_urls.add(safe_url)
+            logger.info("WEBSOCKET_OPENED url=%s", safe_url)
+        parsed = urlsplit(socket.url)
+        is_pairs_socket = (
+            parsed.hostname == "io.dexscreener.com"
+            and "/dex/screener/" in parsed.path
+            and "/pairs/" in parsed.path
+        )
+        if not is_pairs_socket:
             return
         self.socket = socket
         self.socket_connected = True
-        self.last_socket_frame_at = now_ms()
-        logger.info("DISCOVERY_CONNECTED")
+        self.socket_connected_at = now_ms()
+        self.last_socket_frame_at = None
+        self.last_socket_url = safe_url
+        self.challenge_detected = False
+        logger.info("DISCOVERY_CONNECTED url=%s", safe_url)
         socket.on("framereceived", self._on_frame)
         socket.on("close", lambda _: self._on_socket_close(socket))
         socket.on("socketerror", lambda _: self._on_socket_close(socket))
+        if not self.resource_route_task or self.resource_route_task.done():
+            self.resource_route_task = asyncio.create_task(self._enable_resource_blocking())
 
     def _on_socket_close(self, socket):
         if self.socket is socket:
             self.socket_connected = False
+            self.socket_connected_at = None
 
     def _on_frame(self, payload):
         self.last_socket_frame_at = now_ms()
@@ -166,6 +252,13 @@ class BrowserSource:
             self.discovery_queue.put_nowait(pair)
 
     async def close(self):
+        if self.resource_route_task and not self.resource_route_task.done():
+            self.resource_route_task.cancel()
+            try:
+                await self.resource_route_task
+            except asyncio.CancelledError:
+                pass
+        self.resource_route_task = None
         if self.context:
             try:
                 await asyncio.wait_for(self.context.close(), timeout=5)
@@ -187,9 +280,11 @@ class BrowserSource:
         self.page = None
         self.socket = None
         self.socket_connected = False
+        self.socket_connected_at = None
         self.started_at = None
         self.last_socket_frame_at = None
         self.socket_pairs_seen = False
+        self.resource_blocking_enabled = False
         self.discovery_queue = asyncio.Queue(maxsize=1000)
 
     async def discover(self) -> list[dict]:
@@ -198,8 +293,10 @@ class BrowserSource:
         now = now_ms()
         if not self.socket_connected and now - self.started_at > 30_000:
             raise RuntimeError("Dexscreener discovery socket did not connect")
-        if self.socket_connected and self.last_socket_frame_at and now - self.last_socket_frame_at > 60_000:
-            raise RuntimeError("Dexscreener discovery socket is silent for 60 seconds")
+        if self.socket_connected:
+            last_activity = self.last_socket_frame_at or self.socket_connected_at
+            if last_activity and now - last_activity > 60_000:
+                raise RuntimeError("Dexscreener discovery socket is silent for 60 seconds")
         rows = []
         try:
             rows.append(await asyncio.wait_for(self.discovery_queue.get(), timeout=2))

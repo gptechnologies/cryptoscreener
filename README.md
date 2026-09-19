@@ -33,4 +33,6 @@ cd frontend && npm run build
 
 After deployment, confirm exactly one browser, socket connection and fresh frames in `/health`, new unique candidates, each first candle against Dexscreener, qualification, market/RVOL/chart updates, sound on/off, deletion, and recovery after a browser restart. A successful local unit test does not confirm that the live undocumented WebSocket envelope still matches the parser. If it does not, DOM fallback supplies visible New Pairs while the parser is updated.
 
+The browser allows up to 90 seconds for Dexscreener's Cloudflare check to complete before restarting. It loads that check with full resources, then blocks images, media, and fonts only after the pair socket connects. `/health` reports `cloudflare_challenge`, the sanitized page URL/title, observed sanitized WebSocket URLs, browser restart count, and the last socket frame. A challenge or scanner error produces `status: degraded` while `/health` remains a cheap HTTP 200 liveness response.
+
 API: `GET /health`, `GET /api/candidates`, `GET /api/qualified`, `DELETE /api/qualified/{pair_id}`.

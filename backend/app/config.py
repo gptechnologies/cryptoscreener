@@ -19,6 +19,7 @@ class Settings:
         "https://dexscreener.com/new-pairs/solana?rankBy=pairAge&order=asc",
     )
     database_path: str = os.getenv("DATABASE_PATH", ":memory:")
+    browser_challenge_timeout: float = _number("BROWSER_CHALLENGE_TIMEOUT_SECONDS", 90)
     discovery_interval: float = _number("DISCOVERY_INTERVAL_SECONDS", 1.5)
     thresholds: tuple = (
         _number("ONE_MIN_VOLUME_THRESHOLD", 5000),
